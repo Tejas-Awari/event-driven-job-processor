@@ -1,3 +1,4 @@
+
 require("dotenv").config();
 
 const express = require("express");
@@ -9,16 +10,13 @@ const app = express();
 const PORT = 3000;
 
 app.use(express.json({ limit: "100kb" }));
-
 app.get("/health", (req, res) => {
   res.json({
     status: "ok"
   });
 });
-
 app.post("/jobs", async (req, res) => {
   const payload = req.body;
-
   if (
     !payload ||
     typeof payload !== "object" ||
@@ -29,11 +27,8 @@ app.post("/jobs", async (req, res) => {
       error: "Request body must be a non-empty JSON object"
     });
   }
-
   const jobId = randomUUID();
   let job;
-
-  // First, persist the job in PostgreSQL.
   try {
     const result = await pool.query(
       `INSERT INTO jobs (id, status, payload)
@@ -41,23 +36,17 @@ app.post("/jobs", async (req, res) => {
        RETURNING id, status, payload, attempts, created_at`,
       [jobId, "QUEUED", JSON.stringify(payload)]
     );
-
     job = result.rows[0];
   } catch (error) {
     console.error("Failed to save job:", error.message);
-
     return res.status(500).json({
       error: "Failed to create job"
     });
   }
-
-  // Next, publish the job ID to RabbitMQ.
   try {
     await publishJob(job.id);
   } catch (error) {
     console.error("Failed to publish job:", error.message);
-
-    // Record the enqueue failure in PostgreSQL.
     try {
       await pool.query(
         `UPDATE jobs
@@ -77,15 +66,12 @@ app.post("/jobs", async (req, res) => {
         dbError.message
       );
     }
-
     return res.status(503).json({
       jobId: job.id,
       status: "FAILED",
       error: "Unable to enqueue job right now"
     });
   }
-
-  // Return success only after RabbitMQ confirms publication.
   return res.status(201).json({
     jobId: job.id,
     status: job.status,
@@ -94,13 +80,57 @@ app.post("/jobs", async (req, res) => {
     createdAt: job.created_at
   });
 });
-
+app.get("/jobs/:id", async (req, res) => {
+  const jobId = req.params.id;
+  const uuidPattern =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!uuidPattern.test(jobId)) {
+    return res.status(400).json({
+      error: "Invalid job ID format"
+    });
+  }
+  try {
+    const queryResult = await pool.query(
+      `SELECT
+         id,
+         status,
+         payload,
+         result,
+         attempts,
+         error_message,
+         created_at,
+         updated_at
+       FROM jobs
+       WHERE id = $1`,
+      [jobId]
+    );
+    if (queryResult.rowCount === 0) {
+      return res.status(404).json({
+        error: "Job not found"
+      });
+    }
+    const job = queryResult.rows[0];
+    return res.status(200).json({
+      jobId: job.id,
+      status: job.status,
+      payload: job.payload,
+      result: job.result,
+      attempts: job.attempts,
+      error: job.error_message,
+      createdAt: job.created_at,
+      updatedAt: job.updated_at
+    });
+  } catch (error) {
+    console.error("Failed to fetch job:", error.message);
+    return res.status(500).json({
+      error: "Failed to fetch job status"
+    });
+  }
+});
 async function startServer() {
   try {
     await pool.query("SELECT 1");
-
     console.log("Connected to PostgreSQL");
-
     app.listen(PORT, () => {
       console.log(`API server running on http://localhost:${PORT}`);
     });
@@ -109,9 +139,8 @@ async function startServer() {
       "Unable to connect to PostgreSQL:",
       error.message
     );
-
     process.exit(1);
   }
 }
-
 startServer();
+
