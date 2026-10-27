@@ -60,11 +60,12 @@ async function publishJob(jobId) {
     Buffer.from(JSON.stringify(message)),
     {
       persistent: true,
-      contentType: "application/json"
+      contentType: "application/json",
+      headers: {
+       "x-retry-count": 0
+     } 
     }
   );
-
-  // Wait for RabbitMQ to confirm the published message.
   await channel.waitForConfirms();
 }
 

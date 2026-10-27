@@ -3,12 +3,22 @@ require("dotenv").config();
 const amqp = require("amqplib");
 const pool = require("../db/pool");
 
-const QUEUE_NAME = "job_queue";
+const JOB_QUEUE = "job_queue";
+const RETRY_QUEUE = "job_retry_queue";
+const DLQ = "job_dead_letter_queue";
+
+const MAX_ATTEMPTS = 3;
+const RETRY_DELAY_MS = 5000;
 
 function sleep(milliseconds) {
   return new Promise((resolve) => {
     setTimeout(resolve, milliseconds);
   });
+}
+
+async function publishConfirmed(channel, queue, content, options) {
+  channel.sendToQueue(queue, content, options);
+  await channel.waitForConfirms();
 }
 
 async function processJob(channel, message) {
@@ -17,26 +27,57 @@ async function processJob(channel, message) {
   }
 
   let jobId;
+  let retryCount = 0;
 
-  // Read the message received from RabbitMQ.
   try {
-    const payload = JSON.parse(message.content.toString());
-    jobId = payload.jobId;
+    const received = JSON.parse(message.content.toString());
 
-    if (typeof jobId !== "string" || jobId.length === 0) {
-      throw new Error("Message does not contain a valid jobId");
+    jobId = received.jobId;
+
+    if (typeof jobId !== "string" || !jobId) {
+      throw new Error("Message has no valid jobId");
+    }
+
+    const headerValue =
+      message.properties.headers?.["x-retry-count"] ?? 0;
+
+    retryCount = Number(headerValue);
+
+    if (!Number.isInteger(retryCount) || retryCount < 0) {
+      throw new Error("Invalid retry-count header");
     }
   } catch (error) {
-    console.error("Invalid message:", error.message);
+    console.error("[Worker] Invalid message:", error.message);
 
-    // Discard malformed messages for this milestone.
-    // A DLQ will be implemented in Milestone 6.
-    channel.ack(message);
+    try {
+      await publishConfirmed(
+        channel,
+        DLQ,
+        Buffer.from(JSON.stringify({
+          reason: error.message,
+          originalMessage: message.content.toString(),
+          failedAt: new Date().toISOString()
+        })),
+        {
+          persistent: true,
+          contentType: "application/json"
+        }
+      );
+
+      channel.ack(message);
+    } catch (publishError) {
+      console.error("[Worker] Could not send invalid message to DLQ:",
+        publishError.message);
+      channel.nack(message, false, true);
+    }
+
     return;
   }
 
+  const attemptNumber = retryCount + 1;
+
   try {
-    // Step 1: Change job status to PROCESSING.
+    // Mark the job as processing and increment attempts.
     const started = await pool.query(
       `UPDATE jobs
        SET status = 'PROCESSING',
@@ -44,23 +85,35 @@ async function processJob(channel, message) {
            error_message = NULL,
            updated_at = CURRENT_TIMESTAMP
        WHERE id = $1
-       RETURNING id`,
+         AND status NOT IN ('COMPLETED', 'FAILED')
+       RETURNING id, payload, attempts`,
       [jobId]
     );
 
     if (started.rowCount === 0) {
-      console.error(`Job not found in PostgreSQL: ${jobId}`);
+      console.log(
+        `[Worker] Job not found or already finished: ${jobId}`
+      );
 
       channel.ack(message);
       return;
     }
 
-    console.log(`[Worker] Processing job: ${jobId}`);
+    const job = started.rows[0];
 
-    // Step 2: Simulate expensive processing.
+    console.log(
+      `[Worker] Processing ${jobId}, attempt ${attemptNumber}/${MAX_ATTEMPTS}`
+    );
+
+    // Intentional failure switch for testing retries and the DLQ.
+    if (job.payload?.failAlways === true) {
+      throw new Error("Simulated failure: failAlways is true");
+    }
+
+    // Simulate a long-running task.
     await sleep(10000);
 
-    // Step 3: Store the result and mark the job complete.
+    // Save the result before acknowledging the message.
     await pool.query(
       `UPDATE jobs
        SET status = 'COMPLETED',
@@ -73,31 +126,93 @@ async function processJob(channel, message) {
 
     console.log(`[Worker] Completed job: ${jobId}`);
 
-    // Acknowledge the message only after processing is saved.
     channel.ack(message);
   } catch (error) {
-    console.error(`[Worker] Failed job ${jobId}:`, error.message);
+    const errorMessage = String(error.message).slice(0, 2000);
+
+    console.error(
+      `[Worker] Attempt ${attemptNumber} failed for ${jobId}:`,
+      errorMessage
+    );
 
     try {
-      // For now, record the failure without automatic retries.
-      await pool.query(
-        `UPDATE jobs
-         SET status = 'FAILED',
-             error_message = $2,
-             updated_at = CURRENT_TIMESTAMP
-         WHERE id = $1`,
-        [jobId, error.message]
-      );
+      if (attemptNumber < MAX_ATTEMPTS) {
+        // Schedule the next attempt after a delay.
+        await pool.query(
+          `UPDATE jobs
+           SET status = 'QUEUED',
+               error_message = $2,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = $1`,
+          [jobId, errorMessage]
+        );
 
+        const headers = {
+          ...(message.properties.headers || {}),
+          "x-retry-count": attemptNumber
+        };
+
+        await publishConfirmed(
+          channel,
+          RETRY_QUEUE,
+          message.content,
+          {
+            persistent: true,
+            contentType: "application/json",
+            headers
+          }
+        );
+
+        console.log(
+          `[Worker] Retry scheduled for ${jobId} ` +
+          `(attempt ${attemptNumber + 1} after 5 seconds)`
+        );
+      } else {
+        // Publish to DLQ before acknowledging the original message.
+        const deadLetter = Buffer.from(JSON.stringify({
+          jobId,
+          attempts: attemptNumber,
+          reason: errorMessage,
+          failedAt: new Date().toISOString()
+        }));
+
+        await publishConfirmed(
+          channel,
+          DLQ,
+          deadLetter,
+          {
+            persistent: true,
+            contentType: "application/json",
+            headers: {
+              "x-job-id": jobId,
+              "x-attempts": attemptNumber
+            }
+          }
+        );
+
+        await pool.query(
+          `UPDATE jobs
+           SET status = 'FAILED',
+               error_message = $2,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = $1`,
+          [jobId, errorMessage]
+        );
+
+        console.error(
+          `[Worker] Max attempts reached. Job sent to DLQ: ${jobId}`
+        );
+      }
+
+      // The retry or DLQ publish was confirmed.
       channel.ack(message);
-      console.log(`[Worker] Marked job FAILED: ${jobId}`);
-    } catch (databaseError) {
+    } catch (handlingError) {
       console.error(
-        "[Worker] Could not save the failure status:",
-        databaseError.message
+        "[Worker] Could not safely schedule retry/DLQ:",
+        handlingError.message
       );
 
-      // Keep the message available if we cannot update PostgreSQL.
+      // Retain the original message for another delivery.
       channel.nack(message, false, true);
     }
   }
@@ -112,22 +227,39 @@ async function startWorker() {
     process.env.RABBITMQ_URL
   );
 
-  const channel = await connection.createChannel();
+  const channel = await connection.createConfirmChannel();
 
-  await channel.assertQueue(QUEUE_NAME, {
+  // Main queue.
+  await channel.assertQueue(JOB_QUEUE, {
     durable: true
   });
 
-  // Process one unacknowledged job at a time.
+  // Retry queue: wait 5 seconds, then route back to job_queue.
+  await channel.assertQueue(RETRY_QUEUE, {
+    durable: true,
+    arguments: {
+      "x-message-ttl": RETRY_DELAY_MS,
+      "x-dead-letter-exchange": "",
+      "x-dead-letter-routing-key": JOB_QUEUE
+    }
+  });
+
+  // Permanent-failure queue.
+  await channel.assertQueue(DLQ, {
+    durable: true
+  });
+
   channel.prefetch(1);
 
-  console.log(`[Worker] Listening on queue: ${QUEUE_NAME}`);
+  console.log(`[Worker] Listening on ${JOB_QUEUE}`);
+  console.log(`[Worker] Retry queue: ${RETRY_QUEUE}`);
+  console.log(`[Worker] Dead letter queue: ${DLQ}`);
 
   await channel.consume(
-    QUEUE_NAME,
+    JOB_QUEUE,
     (message) => {
       processJob(channel, message).catch((error) => {
-        console.error("[Worker] Unexpected processing error:", error);
+        console.error("[Worker] Unexpected error:", error.message);
       });
     },
     { noAck: false }
