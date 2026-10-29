@@ -1,54 +1,60 @@
 require("dotenv").config();
-
 const amqp = require("amqplib");
 const pool = require("../db/pool");
-
+const JOB_EVENTS_QUEUE = "job_events";
 const JOB_QUEUE = "job_queue";
 const RETRY_QUEUE = "job_retry_queue";
 const DLQ = "job_dead_letter_queue";
-
 const MAX_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 5000;
-
 function sleep(milliseconds) {
   return new Promise((resolve) => {
     setTimeout(resolve, milliseconds);
   });
 }
-
 async function publishConfirmed(channel, queue, content, options) {
   channel.sendToQueue(queue, content, options);
   await channel.waitForConfirms();
 }
 
+async function publishJobEvent(channel, event) {
+  try {
+    await publishConfirmed(
+      channel,
+      JOB_EVENTS_QUEUE,
+      Buffer.from(JSON.stringify(event)),
+      {
+        persistent: true,
+        contentType: "application/json"
+      }
+    );
+  } catch (error) {
+    console.error(
+      `[Worker] Failed to publish ${event.event}:`,
+      error.message
+    );
+  }
+}
 async function processJob(channel, message) {
   if (!message) {
     return;
   }
-
   let jobId;
   let retryCount = 0;
-
   try {
     const received = JSON.parse(message.content.toString());
-
     jobId = received.jobId;
-
     if (typeof jobId !== "string" || !jobId) {
       throw new Error("Message has no valid jobId");
     }
-
     const headerValue =
       message.properties.headers?.["x-retry-count"] ?? 0;
-
     retryCount = Number(headerValue);
-
     if (!Number.isInteger(retryCount) || retryCount < 0) {
       throw new Error("Invalid retry-count header");
     }
   } catch (error) {
     console.error("[Worker] Invalid message:", error.message);
-
     try {
       await publishConfirmed(
         channel,
@@ -63,21 +69,16 @@ async function processJob(channel, message) {
           contentType: "application/json"
         }
       );
-
       channel.ack(message);
     } catch (publishError) {
       console.error("[Worker] Could not send invalid message to DLQ:",
         publishError.message);
       channel.nack(message, false, true);
     }
-
     return;
   }
-
   const attemptNumber = retryCount + 1;
-
   try {
-    // Mark the job as processing and increment attempts.
     const started = await pool.query(
       `UPDATE jobs
        SET status = 'PROCESSING',
@@ -89,31 +90,22 @@ async function processJob(channel, message) {
        RETURNING id, payload, attempts`,
       [jobId]
     );
-
     if (started.rowCount === 0) {
       console.log(
         `[Worker] Job not found or already finished: ${jobId}`
       );
-
       channel.ack(message);
       return;
     }
-
     const job = started.rows[0];
-
     console.log(
       `[Worker] Processing ${jobId}, attempt ${attemptNumber}/${MAX_ATTEMPTS}`
     );
-
-    // Intentional failure switch for testing retries and the DLQ.
     if (job.payload?.failAlways === true) {
       throw new Error("Simulated failure: failAlways is true");
     }
-
-    // Simulate a long-running task.
     await sleep(10000);
-
-    // Save the result before acknowledging the message.
+    const resultText = "Processing completed successfully";
     await pool.query(
       `UPDATE jobs
        SET status = 'COMPLETED',
@@ -123,21 +115,23 @@ async function processJob(channel, message) {
        WHERE id = $1`,
       [jobId, "Processing completed successfully"]
     );
-
+    await publishJobEvent(channel, {
+      event: "job.completed",
+      jobId,
+      status: "COMPLETED",
+      result: resultText,
+      occurredAt: new Date().toISOString()
+    });
     console.log(`[Worker] Completed job: ${jobId}`);
-
     channel.ack(message);
   } catch (error) {
     const errorMessage = String(error.message).slice(0, 2000);
-
     console.error(
       `[Worker] Attempt ${attemptNumber} failed for ${jobId}:`,
       errorMessage
     );
-
     try {
       if (attemptNumber < MAX_ATTEMPTS) {
-        // Schedule the next attempt after a delay.
         await pool.query(
           `UPDATE jobs
            SET status = 'QUEUED',
@@ -146,12 +140,10 @@ async function processJob(channel, message) {
            WHERE id = $1`,
           [jobId, errorMessage]
         );
-
         const headers = {
           ...(message.properties.headers || {}),
           "x-retry-count": attemptNumber
         };
-
         await publishConfirmed(
           channel,
           RETRY_QUEUE,
@@ -162,20 +154,17 @@ async function processJob(channel, message) {
             headers
           }
         );
-
         console.log(
           `[Worker] Retry scheduled for ${jobId} ` +
           `(attempt ${attemptNumber + 1} after 5 seconds)`
         );
       } else {
-        // Publish to DLQ before acknowledging the original message.
         const deadLetter = Buffer.from(JSON.stringify({
           jobId,
           attempts: attemptNumber,
           reason: errorMessage,
           failedAt: new Date().toISOString()
         }));
-
         await publishConfirmed(
           channel,
           DLQ,
@@ -189,7 +178,6 @@ async function processJob(channel, message) {
             }
           }
         );
-
         await pool.query(
           `UPDATE jobs
            SET status = 'FAILED',
@@ -198,43 +186,39 @@ async function processJob(channel, message) {
            WHERE id = $1`,
           [jobId, errorMessage]
         );
-
+        await publishJobEvent(channel, {
+          event: "job.failed",
+          jobId,
+          status: "FAILED",
+          attempts: attemptNumber,
+          error: errorMessage,
+          occurredAt: new Date().toISOString()
+        });        
         console.error(
           `[Worker] Max attempts reached. Job sent to DLQ: ${jobId}`
         );
       }
-
-      // The retry or DLQ publish was confirmed.
       channel.ack(message);
     } catch (handlingError) {
       console.error(
         "[Worker] Could not safely schedule retry/DLQ:",
         handlingError.message
       );
-
-      // Retain the original message for another delivery.
       channel.nack(message, false, true);
     }
   }
 }
-
 async function startWorker() {
   if (!process.env.RABBITMQ_URL) {
     throw new Error("RABBITMQ_URL is not configured");
   }
-
   const connection = await amqp.connect(
     process.env.RABBITMQ_URL
   );
-
-  const channel = await connection.createConfirmChannel();
-
-  // Main queue.
+ const channel = await connection.createConfirmChannel();
   await channel.assertQueue(JOB_QUEUE, {
     durable: true
   });
-
-  // Retry queue: wait 5 seconds, then route back to job_queue.
   await channel.assertQueue(RETRY_QUEUE, {
     durable: true,
     arguments: {
@@ -243,18 +227,16 @@ async function startWorker() {
       "x-dead-letter-routing-key": JOB_QUEUE
     }
   });
-
-  // Permanent-failure queue.
   await channel.assertQueue(DLQ, {
     durable: true
   });
-
+  await channel.assertQueue(JOB_EVENTS_QUEUE, {
+    durable: true
+  });
   channel.prefetch(1);
-
   console.log(`[Worker] Listening on ${JOB_QUEUE}`);
   console.log(`[Worker] Retry queue: ${RETRY_QUEUE}`);
   console.log(`[Worker] Dead letter queue: ${DLQ}`);
-
   await channel.consume(
     JOB_QUEUE,
     (message) => {
@@ -264,10 +246,8 @@ async function startWorker() {
     },
     { noAck: false }
   );
-
   async function shutdown() {
     console.log("\n[Worker] Shutting down...");
-
     try {
       await channel.close();
       await connection.close();
@@ -275,14 +255,11 @@ async function startWorker() {
     } catch (error) {
       console.error("[Worker] Shutdown error:", error.message);
     }
-
     process.exit(0);
   }
-
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
 }
-
 startWorker().catch((error) => {
   console.error("[Worker] Startup failed:", error.message);
   process.exit(1);
