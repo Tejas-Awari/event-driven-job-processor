@@ -86,9 +86,10 @@ async function processJob(channel, message) {
            error_message = NULL,
            updated_at = CURRENT_TIMESTAMP
        WHERE id = $1
-         AND status NOT IN ('COMPLETED', 'FAILED')
+         AND status = 'QUEUED'
+         AND attempts = $2
        RETURNING id, payload, attempts`,
-      [jobId]
+      [jobId, retryCount]
     );
     if (started.rowCount === 0) {
       console.log(
