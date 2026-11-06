@@ -13,6 +13,7 @@ const DLQ = "job_dead_letter_queue";
 const MAX_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 5000;
 const LEASE_DURATION_SECONDS = 60;
+const JOB_TIMEOUT_MS = 30000;
 const HEARTBEAT_INTERVAL_MS = 15000;
 const RECOVERY_INTERVAL_MS = 10000;
 const RECOVERY_BATCH_SIZE = 25;
@@ -28,6 +29,31 @@ class LeaseLostError extends Error {
 
 function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+function sleepWithAbort(milliseconds, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new Error("Job processing aborted"));
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, milliseconds);
+
+    function onAbort() {
+      clearTimeout(timer);
+      cleanup();
+      reject(new Error("Job processing aborted"));
+    }
+
+    function cleanup() {
+      signal.removeEventListener("abort", onAbort);
+    }
+
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 async function renewJobLease(jobId) {
@@ -100,12 +126,37 @@ async function sleepWhileLeaseValid(milliseconds, heartbeat) {
     }
 
     const duration = Math.min(interval, milliseconds - elapsed);
-    await sleep(duration);
+    await sleepWithAbort(duration, signal);
     elapsed += duration;
   }
 
   if (heartbeat.hasLostLease()) {
     throw new LeaseLostError("Worker lost its lease during processing");
+  }
+}
+
+async function runWithTimeout(task, timeoutMs) {
+  const controller = new AbortController();
+
+  let timeoutId;
+
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      controller.abort();
+
+      reject(
+        new Error(`Job timed out after ${timeoutMs}ms`)
+      );
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([
+      task(controller.signal),
+      timeoutPromise
+    ]);
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
@@ -378,8 +429,49 @@ async function processJob(channel, message) {
     ) {
       throw new Error("Simulated failure: failAlways is true");
     }
+    await runWithTimeout(
+      async (signal) => {
+        const interval = 250;
+        let elapsed = 0;
 
-    await sleepWhileLeaseValid(10000, heartbeat);
+        const requestedProcessingTime = Number(
+          job.payload?.processingTimeMs ??
+          job.payload?.payload?.processingTimeMs ??
+          10000
+        );
+
+        if (
+          !Number.isFinite(requestedProcessingTime) ||
+          requestedProcessingTime < 0
+        ) {
+          throw new Error("Invalid processing time");
+        }
+
+        const processingTime = requestedProcessingTime;
+
+        while (elapsed < processingTime) {
+          if (signal.aborted) {
+            throw new Error("Job processing aborted");
+          }
+
+          if (heartbeat.hasLostLease()) {
+            throw new LeaseLostError(
+              "Worker lost its lease during processing"
+            );
+          }
+
+          const duration = Math.min(
+            interval,
+            processingTime - elapsed
+          );
+
+          await sleepWithAbort(duration, signal);
+          elapsed += duration;
+        }
+      },
+      JOB_TIMEOUT_MS
+    );
+
 
     if (heartbeat.hasLostLease()) {
       throw new LeaseLostError("Lease lost before completion");
