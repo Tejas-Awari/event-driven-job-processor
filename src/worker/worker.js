@@ -115,30 +115,11 @@ function startHeartbeat(jobId) {
     hasLostLease: () => leaseLost
   };
 }
-
-async function sleepWhileLeaseValid(milliseconds, heartbeat) {
-  const interval = 250;
-  let elapsed = 0;
-
-  while (elapsed < milliseconds) {
-    if (heartbeat.hasLostLease()) {
-      throw new LeaseLostError("Worker lost its lease during processing");
-    }
-
-    const duration = Math.min(interval, milliseconds - elapsed);
-    await sleepWithAbort(duration, signal);
-    elapsed += duration;
-  }
-
-  if (heartbeat.hasLostLease()) {
-    throw new LeaseLostError("Worker lost its lease during processing");
-  }
-}
-
-async function runWithTimeout(task, timeoutMs) {
+async function runWithTimeout(task, timeoutMs, externalSignal) {
   const controller = new AbortController();
 
   let timeoutId;
+  let externalAbortHandler;
 
   const timeoutPromise = new Promise((_, reject) => {
     timeoutId = setTimeout(() => {
@@ -150,13 +131,43 @@ async function runWithTimeout(task, timeoutMs) {
     }, timeoutMs);
   });
 
+  const shutdownPromise = externalSignal
+    ? new Promise((_, reject) => {
+        externalAbortHandler = () => {
+          controller.abort();
+
+          reject(
+            new Error("Job processing interrupted by worker shutdown")
+          );
+        };
+
+        if (externalSignal.aborted) {
+          externalAbortHandler();
+        } else {
+          externalSignal.addEventListener(
+            "abort",
+            externalAbortHandler,
+            { once: true }
+          );
+        }
+      })
+    : new Promise(() => {});
+
   try {
     return await Promise.race([
       task(controller.signal),
-      timeoutPromise
+      timeoutPromise,
+      shutdownPromise
     ]);
   } finally {
     clearTimeout(timeoutId);
+
+    if (externalSignal && externalAbortHandler) {
+      externalSignal.removeEventListener(
+        "abort",
+        externalAbortHandler
+      );
+    }
   }
 }
 
@@ -339,7 +350,7 @@ async function requeueJobForRetry(
   }
 }
 
-async function processJob(channel, message) {
+async function processJob(channel, message,shutdownSignal) {
   if (!message) return;
 
   let jobId;
@@ -469,7 +480,8 @@ async function processJob(channel, message) {
           elapsed += duration;
         }
       },
-      JOB_TIMEOUT_MS
+      JOB_TIMEOUT_MS,
+      shutdownSignal
     );
 
 
@@ -516,10 +528,28 @@ async function processJob(channel, message) {
 
     channel.ack(message);
   } catch (error) {
-    if (heartbeat) {
-      heartbeat.stop();
-    }
+        // During forced shutdown, do not consume a retry attempt.
+    // Return the unacknowledged message to RabbitMQ.
+    if (shutdownSignal?.aborted) {
+      if (heartbeat) {
+        heartbeat.stop();
+      }
 
+      console.warn(
+        `[Worker] Shutdown interrupted job ${jobId || "unknown"}; requeuing message`
+      );
+
+      try {
+        channel.nack(message, false, true);
+      } catch (nackError) {
+        console.error(
+          "[Worker] Could not requeue interrupted message:",
+          nackError.message
+        );
+      }
+
+      return;
+    }
     const errorMessage = String(error.message || error).slice(0, 2000);
 
     console.error(
@@ -726,288 +756,431 @@ async function recoverExpiredJobs(channel) {
     );
   }
 }
-
-async function startWorker() {
-  if (!process.env.RABBITMQ_URL) {
-    throw new Error("RABBITMQ_URL is not configured");
-  }
-
-  let connection = null;
-  let channel = null;
-  let recoveryTimer = null;
-  let reconnectTimer = null;
-
-  let shuttingDown = false;
-  let reconnectAttempts = 0;
-
-  const MAX_RECONNECT_DELAY_MS = 30000;
-
-  function stopRecoveryTimer() {
-    if (recoveryTimer) {
-      clearInterval(recoveryTimer);
-      recoveryTimer = null;
+  async function startWorker() {
+    if (!process.env.RABBITMQ_URL) {
+      throw new Error("RABBITMQ_URL is not configured");
     }
-  }
 
-  function scheduleReconnect(reason) {
-    if (shuttingDown || reconnectTimer) return;
+    const SHUTDOWN_GRACE_PERIOD_MS = 35000;
+    const MAX_RECONNECT_DELAY_MS = 30000;
 
-    stopRecoveryTimer();
+    let connection = null;
+    let channel = null;
+    let consumerTag = null;
 
-    const delay = Math.min(
-      1000 * (2 ** reconnectAttempts),
-      MAX_RECONNECT_DELAY_MS
-    );
+    let recoveryTimer = null;
+    let reconnectTimer = null;
 
-    reconnectAttempts += 1;
+    let shuttingDown = false;
+    let reconnectAttempts = 0;
+    let recoveryInProgress = false;
+    let recoveryPromise = Promise.resolve();
 
-    console.error(
-      `[Worker] ${reason}. Reconnecting in ${delay / 1000}s...`
-    );
+    // Tracks every job handler currently running.
+    const activeJobs = new Set();
 
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null;
-      connectAndConsume();
-    }, delay);
-  }
+    // Aborted only if the graceful shutdown deadline expires.
+    const shutdownController = new AbortController();
 
-  async function connectAndConsume() {
-    if (shuttingDown) return;
-
-    let newConnection;
-    let newChannel;
-
-    try {
-      console.log("[Worker] Connecting to RabbitMQ...");
-
-      newConnection = await amqp.connect(
-        process.env.RABBITMQ_URL
-      );
-
-      if (shuttingDown) {
-        await newConnection.close();
-        return;
+    function stopRecoveryTimer() {
+      if (recoveryTimer) {
+        clearInterval(recoveryTimer);
+        recoveryTimer = null;
       }
+    }
 
-      connection = newConnection;
-
-      newConnection.on("error", (error) => {
-        console.error(
-          "[Worker] RabbitMQ connection error:",
-          error.message
-        );
-      });
-
-      newConnection.on("close", () => {
-        if (connection !== newConnection || shuttingDown) return;
-
-        connection = null;
-        channel = null;
-
-        scheduleReconnect("RabbitMQ connection closed");
-      });
-
-      newChannel = await newConnection.createConfirmChannel();
-
-      if (shuttingDown) {
-        await newChannel.close();
-        await newConnection.close();
-        return;
-      }
-
-      channel = newChannel;
-
-      newChannel.on("error", (error) => {
-        console.error(
-          "[Worker] RabbitMQ channel error:",
-          error.message
-        );
-      });
-
-      newChannel.on("close", () => {
-        if (channel !== newChannel || shuttingDown) return;
-
-        channel = null;
-        connection = null;
-
-        stopRecoveryTimer();
-
-        // Closing the old connection also triggers its close event.
-        newConnection.close().catch(() => {});
-
-        scheduleReconnect("RabbitMQ channel closed");
-      });
-
-      await newChannel.assertQueue(JOB_QUEUE, {
-        durable: true
-      });
-
-      await newChannel.assertQueue(RETRY_QUEUE, {
-        durable: true,
-        arguments: {
-          "x-message-ttl": RETRY_DELAY_MS,
-          "x-dead-letter-exchange": "",
-          "x-dead-letter-routing-key": JOB_QUEUE
-        }
-      });
-
-      await newChannel.assertQueue(DLQ, {
-        durable: true
-      });
-
-      await newChannel.assertQueue(JOB_EVENTS_QUEUE, {
-        durable: true
-      });
-
-      newChannel.prefetch(1);
-
-      try {
-        await recoverExpiredJobs(newChannel);
-      } catch (error) {
-        console.error(
-          "[Worker] Initial expired-job recovery failed:",
-          error.message
-        );
-      }
-
-      if (shuttingDown || channel !== newChannel) return;
+    function scheduleReconnect(reason) {
+      if (shuttingDown || reconnectTimer) return;
 
       stopRecoveryTimer();
 
-      recoveryTimer = setInterval(async () => {
-        if (
-          shuttingDown ||
-          channel !== newChannel
-        ) {
+      const delay = Math.min(
+        1000 * (2 ** reconnectAttempts),
+        MAX_RECONNECT_DELAY_MS
+      );
+
+      reconnectAttempts += 1;
+
+      console.error(
+        `[Worker] ${reason}. Reconnecting in ${delay / 1000}s...`
+      );
+
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connectAndConsume();
+      }, delay);
+    }
+
+    async function connectAndConsume() {
+      if (shuttingDown) return;
+
+      let newConnection;
+      let newChannel;
+
+      try {
+        console.log("[Worker] Connecting to RabbitMQ...");
+
+        newConnection = await amqp.connect(
+          process.env.RABBITMQ_URL
+        );
+
+        if (shuttingDown) {
+          await newConnection.close();
           return;
         }
+
+        connection = newConnection;
+
+        newConnection.on("error", (error) => {
+          console.error(
+            "[Worker] RabbitMQ connection error:",
+            error.message
+          );
+        });
+
+        newConnection.on("close", () => {
+          if (connection !== newConnection || shuttingDown) return;
+
+          connection = null;
+          channel = null;
+          consumerTag = null;
+
+          scheduleReconnect("RabbitMQ connection closed");
+        });
+
+        newChannel = await newConnection.createConfirmChannel();
+
+        if (shuttingDown) {
+          await newChannel.close();
+          await newConnection.close();
+          return;
+        }
+
+        channel = newChannel;
+
+        newChannel.on("error", (error) => {
+          console.error(
+            "[Worker] RabbitMQ channel error:",
+            error.message
+          );
+        });
+
+        newChannel.on("close", () => {
+          if (channel !== newChannel || shuttingDown) return;
+
+          channel = null;
+          connection = null;
+          consumerTag = null;
+
+          stopRecoveryTimer();
+
+          newConnection.close().catch(() => {});
+
+          scheduleReconnect("RabbitMQ channel closed");
+        });
+
+        await newChannel.assertQueue(JOB_QUEUE, {
+          durable: true
+        });
+
+        await newChannel.assertQueue(RETRY_QUEUE, {
+          durable: true,
+          arguments: {
+            "x-message-ttl": RETRY_DELAY_MS,
+            "x-dead-letter-exchange": "",
+            "x-dead-letter-routing-key": JOB_QUEUE
+          }
+        });
+
+        await newChannel.assertQueue(DLQ, {
+          durable: true
+        });
+
+        await newChannel.assertQueue(JOB_EVENTS_QUEUE, {
+          durable: true
+        });
+
+        newChannel.prefetch(1);
 
         try {
           await recoverExpiredJobs(newChannel);
         } catch (error) {
           console.error(
-            "[Worker] Expired-job recovery failed:",
+            "[Worker] Initial expired-job recovery failed:",
             error.message
           );
         }
-      }, RECOVERY_INTERVAL_MS);
 
-      await newChannel.consume(
-        JOB_QUEUE,
-        (message) => {
-          processJob(newChannel, message).catch((error) => {
-            console.error(
-              "[Worker] Unexpected processing error:",
-              error.message
-            );
+        if (shuttingDown || channel !== newChannel) return;
 
-            if (message) {
-              try {
-                newChannel.nack(message, false, true);
-              } catch (_) {
-                // Channel may already be closed.
-              }
-            }
-          });
-        },
-        {
-          noAck: false
+        stopRecoveryTimer();
+
+        recoveryTimer = setInterval(() => {
+          if (
+            shuttingDown ||
+            channel !== newChannel ||
+            recoveryInProgress
+          ) {
+            return;
+          }
+
+          recoveryInProgress = true;
+
+          recoveryPromise = recoverExpiredJobs(newChannel)
+            .catch((error) => {
+              console.error(
+                "[Worker] Expired-job recovery failed:",
+                error.message
+              );
+            })
+            .finally(() => {
+              recoveryInProgress = false;
+            });
+        }, RECOVERY_INTERVAL_MS);
+
+        const consumer = await newChannel.consume(
+          JOB_QUEUE,
+          (message) => {
+            if (!message) return;
+
+            let jobPromise;
+
+            jobPromise = processJob(
+              newChannel,
+              message,
+              shutdownController.signal
+            )
+              .catch((error) => {
+                console.error(
+                  "[Worker] Unexpected processing error:",
+                  error.message
+                );
+
+                try {
+                  newChannel.nack(message, false, true);
+                } catch (_) {
+                  // The channel may already be closed.
+                }
+              })
+              .finally(() => {
+                activeJobs.delete(jobPromise);
+              });
+
+            activeJobs.add(jobPromise);
+          },
+          {
+            noAck: false
+          }
+        );
+
+        consumerTag = consumer.consumerTag;
+
+        if (shuttingDown) {
+          await newChannel.cancel(consumerTag);
+          consumerTag = null;
+          return;
         }
-      );
 
-      reconnectAttempts = 0;
+        reconnectAttempts = 0;
+
+        console.log(
+          `[Worker] ${WORKER_ID} listening on ${JOB_QUEUE}`
+        );
+        console.log(`[Worker] Retry queue: ${RETRY_QUEUE}`);
+        console.log(`[Worker] Dead letter queue: ${DLQ}`);
+        console.log("[Worker] RabbitMQ connection established.");
+      } catch (error) {
+        console.error(
+          "[Worker] RabbitMQ setup failed:",
+          error.message
+        );
+
+        stopRecoveryTimer();
+
+        if (channel === newChannel) {
+          channel = null;
+          consumerTag = null;
+        }
+
+        if (connection === newConnection) {
+          connection = null;
+        }
+
+        try {
+          if (newChannel) {
+            await newChannel.close();
+          }
+        } catch (_) {
+          // Channel may already be closed.
+        }
+
+        try {
+          if (newConnection) {
+            await newConnection.close();
+          }
+        } catch (_) {
+          // Connection may already be closed.
+        }
+
+        scheduleReconnect("RabbitMQ connection/setup failed");
+      }
+    }
+
+    async function waitForActiveJobs(timeoutMs) {
+      if (activeJobs.size === 0) {
+        return true;
+      }
+
+      let timeoutId;
+
+      const jobsFinished = Promise.allSettled(
+        [...activeJobs]
+      ).then(() => true);
+
+      const deadlineReached = new Promise((resolve) => {
+        timeoutId = setTimeout(() => {
+          resolve(false);
+        }, timeoutMs);
+      });
+
+      const completedInTime = await Promise.race([
+        jobsFinished,
+        deadlineReached
+      ]);
+
+      clearTimeout(timeoutId);
+
+      return completedInTime && activeJobs.size === 0;
+    }
+
+    async function shutdown(signalName) {
+      if (shuttingDown) return;
+
+      shuttingDown = true;
 
       console.log(
-        `[Worker] ${WORKER_ID} listening on ${JOB_QUEUE}`
-      );
-      console.log(`[Worker] Retry queue: ${RETRY_QUEUE}`);
-      console.log(`[Worker] Dead letter queue: ${DLQ}`);
-      console.log("[Worker] RabbitMQ connection established.");
-    } catch (error) {
-      console.error(
-        "[Worker] RabbitMQ setup failed:",
-        error.message
+        `\n[Worker] Received ${signalName}. Starting graceful shutdown...`
       );
 
       stopRecoveryTimer();
 
-      if (channel === newChannel) {
-        channel = null;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
       }
 
-      if (connection === newConnection) {
-        connection = null;
+      // Stop RabbitMQ from delivering additional jobs.
+      if (channel && consumerTag) {
+        try {
+          await channel.cancel(consumerTag);
+          console.log("[Worker] RabbitMQ consumer cancelled.");
+        } catch (error) {
+          console.error(
+            "[Worker] Could not cancel consumer:",
+            error.message
+          );
+        }
+
+        consumerTag = null;
+      }
+
+      // Give currently running jobs up to 35 seconds to finish.
+      console.log(
+        `[Worker] Waiting up to ${SHUTDOWN_GRACE_PERIOD_MS / 1000} seconds for ${activeJobs.size} active job(s)...`
+      );
+
+      const jobsFinished = await waitForActiveJobs(
+        SHUTDOWN_GRACE_PERIOD_MS
+      );
+
+      if (jobsFinished) {
+        console.log("[Worker] All active jobs finished.");
+      } else {
+        console.warn(
+          "[Worker] Graceful shutdown deadline reached. Aborting active job processing..."
+        );
+
+        // The processJob catch block will nack interrupted messages.
+        shutdownController.abort();
+
+        // Wait for the handlers to settle before closing the channel
+        // and database pool.
+        await Promise.allSettled([...activeJobs]);
+
+        console.log(
+          "[Worker] Active job handlers have settled."
+        );
+      }
+
+      // Do not close PostgreSQL while recovery work is still running.
+      try {
+        await recoveryPromise;
+      } catch (error) {
+        console.error(
+          "[Worker] Recovery shutdown error:",
+          error.message
+        );
       }
 
       try {
-        if (newChannel) await newChannel.close();
-      } catch (_) {
-        // Channel may already be closed.
+        if (channel) {
+          await channel.close();
+          console.log("[Worker] RabbitMQ channel closed.");
+        }
+      } catch (error) {
+        console.error(
+          "[Worker] Channel shutdown error:",
+          error.message
+        );
       }
 
       try {
-        if (newConnection) await newConnection.close();
-      } catch (_) {
-        // Connection may already be closed.
+        if (connection) {
+          await connection.close();
+          console.log("[Worker] RabbitMQ connection closed.");
+        }
+      } catch (error) {
+        console.error(
+          "[Worker] Connection shutdown error:",
+          error.message
+        );
       }
 
-      scheduleReconnect("RabbitMQ connection/setup failed");
+      try {
+        await pool.end();
+        console.log("[Worker] PostgreSQL pool closed.");
+      } catch (error) {
+        console.error(
+          "[Worker] PostgreSQL shutdown error:",
+          error.message
+        );
+      }
+
+      console.log("[Worker] Graceful shutdown complete.");
     }
+
+    process.once("SIGINT", () => {
+      shutdown("SIGINT").catch((error) => {
+        console.error(
+          "[Worker] Shutdown failed:",
+          error.message
+        );
+        process.exitCode = 1;
+      });
+    });
+
+    process.once("SIGTERM", () => {
+      shutdown("SIGTERM").catch((error) => {
+        console.error(
+          "[Worker] Shutdown failed:",
+          error.message
+        );
+        process.exitCode = 1;
+      });
+    });
+
+    await connectAndConsume();
   }
-
-  async function shutdown() {
-    if (shuttingDown) return;
-
-    shuttingDown = true;
-
-    console.log("\n[Worker] Shutting down...");
-
-    stopRecoveryTimer();
-
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-    }
-
-    try {
-      if (channel) {
-        await channel.close();
-      }
-    } catch (error) {
-      console.error(
-        "[Worker] Channel shutdown error:",
-        error.message
-      );
-    }
-
-    try {
-      if (connection) {
-        await connection.close();
-      }
-    } catch (error) {
-      console.error(
-        "[Worker] Connection shutdown error:",
-        error.message
-      );
-    }
-
-    try {
-      await pool.end();
-    } catch (error) {
-      console.error(
-        "[Worker] PostgreSQL shutdown error:",
-        error.message
-      );
-    }
-
-    process.exit(0);
-  }
-
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
-
-  await connectAndConsume();
-}
 
 startWorker().catch((error) => {
   console.error("[Worker] Startup failed:", error.message);
