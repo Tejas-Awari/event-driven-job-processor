@@ -5,7 +5,6 @@ const http = require("node:http");
 const { randomUUID } = require("node:crypto");
 const { WebSocketServer, WebSocket } = require("ws");
 const pool = require("./db/pool");
-const { publishJob } = require("./queue/rabbitmq");
 const app = express();
 const PORT = 3000;
 const JOB_EVENTS_QUEUE = "job_events";
@@ -17,6 +16,8 @@ app.get("/health", (req, res) => {
 });
 app.post("/jobs", async (req, res) => {
   const payload = req.body;
+
+  // Validate payload
   if (
     !payload ||
     typeof payload !== "object" ||
@@ -24,47 +25,69 @@ app.post("/jobs", async (req, res) => {
     Object.keys(payload).length === 0
   ) {
     return res.status(400).json({
-      error: "Request body must be a non-empty JSON object"
+      error: "Payload must be a non-empty JSON object"
     });
   }
+
   const jobId = randomUUID();
+  const eventId = randomUUID();
+
+  let client;
   let job;
+
   try {
-    const result = await pool.query(
+    client = await pool.connect();
+
+    // Start database transaction
+    await client.query("BEGIN");
+
+    // 1. Insert job
+    const result = await client.query(
       `INSERT INTO jobs (id, status, payload)
        VALUES ($1, $2, $3::jsonb)
        RETURNING id, status, payload, attempts, created_at`,
       [jobId, "QUEUED", JSON.stringify(payload)]
     );
+
     job = result.rows[0];
+
+    // 2. Insert corresponding outbox event
+    await client.query(
+      `INSERT INTO outbox_events
+       (id, event_type, aggregate_id, payload)
+       VALUES ($1, $2, $3, $4::jsonb)`,
+      [
+        eventId,
+        "job.created",
+        jobId,
+        JSON.stringify({ jobId })
+      ]
+    );
+
+    // 3. Commit both records together
+    await client.query("COMMIT");
+
   } catch (error) {
-    console.error("Failed to save job:", error.message);
-    return res.status(500).json({
-      error: "Failed to create job"
-    });
-  }
-  try {
-    await publishJob(job.id);
-  } catch (error) {
-    console.error("Failed to publish job:", error.message);
-    try {
-      await pool.query(
-        `UPDATE jobs
-         SET status = 'FAILED',
-             error_message = $1,
-             updated_at = CURRENT_TIMESTAMP
-         WHERE id = $2`,
-        [`Failed to publish to RabbitMQ: ${error.message}`, job.id]
-      );
-    } catch (dbError) {
-      console.error("Failed to update job:", dbError.message);
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error("Transaction rollback failed:", rollbackError.message);
+      }
     }
-    return res.status(503).json({
-      jobId: job.id,
-      status: "FAILED",
-      error: "Unable to enqueue job right now"
+
+    console.error("Failed to create job:", error.message);
+
+    return res.status(500).json({
+      error: "Unable to create job"
     });
+
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
+  // Return immediately. The outbox publisher will publish asynchronously.
   return res.status(201).json({
     jobId: job.id,
     status: job.status,

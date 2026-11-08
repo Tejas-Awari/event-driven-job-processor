@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "node --watch src/server.js",
     "worker": "node src/worker/worker.js",
+    "outbox": "node src/worker/outbox-publisher.js",
     "test": "node scripts/e2e-test.js",
     "loadtest": "node scripts/load-test.js"
   },
