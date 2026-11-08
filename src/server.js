@@ -11,11 +11,16 @@ const JOB_EVENTS_QUEUE = "job_events";
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 app.use(express.json({ limit: "100kb" }));
+app.use((req, res, next) => {
+  console.log(`[API] ${req.method} ${req.url}`);
+  next();
+});
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 app.post("/jobs", async (req, res) => {
   const payload = req.body;
+  
 
   // Validate payload
   if (
@@ -88,6 +93,7 @@ app.post("/jobs", async (req, res) => {
     }
   }
   // Return immediately. The outbox publisher will publish asynchronously.
+  console.log(`[API] Created Job: ${job.id} | Outbox Event: ${eventId}`);
   return res.status(201).json({
     jobId: job.id,
     status: job.status,
